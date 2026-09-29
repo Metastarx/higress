@@ -15,6 +15,12 @@ var validAlgorithms = map[string]bool{
 	"hmac-sha512": true,
 }
 
+// HmacAuthConfig 保存 hmac-auth-apisix 的全局配置与规则级覆盖配置。
+//
+// 关于 allow：它只会被规则级的 ParseOverrideRuleConfig 读取，全局配置里的
+// allow 会被有意忽略。原因是全局配置无法表达“当前请求命中了哪条 domain/route
+// 规则”，只有规则级 allow 才能真正约束匹配到的流量；规则显式挂载插件但没有
+// allow 时，请求会被拒绝而不是放行。
 type HmacAuthConfig struct {
 	Consumers           []Consumer `json:"consumers" yaml:"consumers"`
 	GlobalAuth          *bool      `json:"global_auth,omitempty" yaml:"global_auth,omitempty"`
@@ -25,7 +31,9 @@ type HmacAuthConfig struct {
 	HideCredentials     bool       `json:"hide_credentials,omitempty" yaml:"hide_credentials,omitempty"`
 	AnonymousConsumer   string     `json:"anonymous_consumer,omitempty" yaml:"anonymous_consumer,omitempty"`
 	Allow               []string   `json:"allow,omitempty" yaml:"allow,omitempty"`
-	// RuleSet 插件是否至少在一个 domain 或 route 上生效
+	// RuleSet 表示当前生效的配置是否来自一条匹配到的 domain/route 规则，
+	// 即当前请求命中了显式挂载本插件的规则。ParseOverrideRuleConfig 会把它置为
+	// true，ParseGlobalConfig 则恒为 false，onHttpRequestHeaders 据此区分二者。
 	RuleSet bool `json:"-" yaml:"-"`
 }
 
@@ -37,6 +45,8 @@ type Consumer struct {
 
 func ParseGlobalConfig(jsonData gjson.Result, global *HmacAuthConfig) error {
 	log.Debug("global config")
+	// 全局配置永远不是规则级配置：RuleSet 恒为 false。同时这里有意不读取 allow，
+	// 全局层面的 allow 不会生效，只有 ParseOverrideRuleConfig 才会解析它。
 	global.RuleSet = false
 
 	// 处理 consumers 配置
@@ -168,6 +178,8 @@ func ParseOverrideRuleConfig(jsonData gjson.Result, global HmacAuthConfig, confi
 		}
 	}
 
+	// 当前请求命中的 domain/route 规则由此获得 RuleSet=true。onHttpRequestHeaders
+	// 依赖它区分“规则显式挂载插件”与“只拿到全局配置”，避免 allow 为空时错误放行。
 	config.RuleSet = true
 	if configBytes, err := json.Marshal(config); err == nil {
 		log.Debugf("config: %s", string(configBytes))

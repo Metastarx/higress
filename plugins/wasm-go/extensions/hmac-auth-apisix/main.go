@@ -64,7 +64,11 @@ func init() {
 
 func onHttpRequestHeaders(ctx wrapper.HttpContext, cfg config.HmacAuthConfig) types.Action {
 	var (
-		// 未配置 allow 列表，表示插件在该 domain/route 未生效
+		// noAllow 为 true 表示当前生效的配置没有声明任何被授权的消费者：
+		// - 全局配置不会读取 allow（见 config.ParseGlobalConfig），所以恒为 true；
+		// - domain/route 规则未写 allow 字段时同样为 true（见 config.ParseOverrideRuleConfig）。
+		// ruleSet 为 true 表示当前请求命中了显式挂载本插件的 domain/route 规则
+		// （由 config.ParseOverrideRuleConfig 置位），而不是只拿到全局配置。
 		noAllow            = len(cfg.Allow) == 0
 		globalAuthNoSet    = cfg.GlobalAuth == nil
 		globalAuthSetTrue  = !globalAuthNoSet && *cfg.GlobalAuth
@@ -72,15 +76,22 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, cfg config.HmacAuthConfig) ty
 		ruleSet            = cfg.RuleSet
 	)
 
-	// 不需要认证而直接放行的情况：
-	// - global_auth == false 且 当前 domain/route 未配置该插件
-	// - global_auth 未设置 且 有至少一个 domain/route 配置该插件 且 当前 domain/route 未配置该插件
-	if globalAuthSetFalse || (globalAuthNoSet && ruleSet) {
-		if noAllow {
-			log.Info("authorization is not required")
-			ctx.DontReadRequestBody()
-			return types.ActionContinue
-		}
+	// 只有当插件对当前请求完全未生效时才跳过认证：显式关闭了全局鉴权（global_auth == false），
+	// 并且当前请求没有命中任何挂载本插件的规则。此时既没有规则要求鉴权，也没有消费者名单可校验，
+	// 直接放行是安全的。
+	if globalAuthSetFalse && !ruleSet && noAllow {
+		log.Info("authorization is not required")
+		ctx.DontReadRequestBody()
+		return types.ActionContinue
+	}
+
+	// 请求命中了显式挂载本插件的规则（ruleSet），但该规则没有配置 allow 列表，
+	// 说明这条规则没有授权任何消费者。此时必须拒绝请求（fail closed）：否则任意未签名的
+	// 请求都会被直接转发到上游，绕过 HMAC 签名校验。global_auth == true 时全局鉴权仍然
+	// 生效，会继续走下面的正常校验流程，不受此分支影响。
+	if ruleSet && noAllow && !globalAuthSetTrue {
+		log.Warnf("plugin is attached to the matched rule but no consumer is allowed; rejecting request")
+		return sendUnauthorizedResponse("no consumer is allowed")
 	}
 	// 提取 HMAC 字段和消费者信息
 	hmacParams, err := retrieveHmacFieldsAndConsumer(cfg)
@@ -96,16 +107,12 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, cfg config.HmacAuthConfig) ty
 	log.Debugf("HMAC params extracted: keyId=%s, algorithm=%s, signature=%s, headers=%v, consumerName=%s",
 		hmacParams.KeyId, hmacParams.Algorithm, hmacParams.Signature, hmacParams.Headers, hmacParams.ConsumerName)
 
-	if globalAuthSetTrue && !noAllow { // 全局生效，但当前 domain/route 配置了 allow 列表
-		if !contains(cfg.Allow, hmacParams.ConsumerName) {
-			log.Warnf("consumer %q is not allowed", hmacParams.ConsumerName)
-			return sendUnauthorizedResponse("consumer '" + hmacParams.ConsumerName + "' is not allowed")
-		}
-	} else if globalAuthSetFalse || (globalAuthNoSet && ruleSet) { // 非全局生效
-		if !noAllow && !contains(cfg.Allow, hmacParams.ConsumerName) { // 配置了 allow 列表且当前消费者不在 allow 列表中
-			log.Warnf("consumer %q is not allowed", hmacParams.ConsumerName)
-			return sendUnauthorizedResponse("consumer '" + hmacParams.ConsumerName + "' is not allowed")
-		}
+	// allow 列表只在当前生效的配置显式声明了它时才生效，与是否开启 global_auth 无关：
+	// 只要配置了 allow，即使签名校验通过，消费者也必须属于该列表，否则同样拒绝。
+	// 全局配置不会读取 allow，因此这里的 cfg.Allow 实际只可能来自匹配到的规则。
+	if !noAllow && !contains(cfg.Allow, hmacParams.ConsumerName) {
+		log.Warnf("consumer %q is not allowed", hmacParams.ConsumerName)
+		return sendUnauthorizedResponse("consumer '" + hmacParams.ConsumerName + "' is not allowed")
 	}
 
 	// 校验时间偏差

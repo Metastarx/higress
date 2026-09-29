@@ -15,6 +15,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
 	"strings"
@@ -36,6 +38,20 @@ func generateTestToken(secretKey string) string {
 
 	tokenString, _ := token.SignedString([]byte(secretKey))
 	return tokenString
+}
+
+// generateRS256Token 用随机生成的 RSA 私钥签发一个 RS256 Token。
+// 插件显式声明了 HMAC 算法白名单（HS256/384/512），这类 Token 必须在
+// 解析阶段就被拒绝，不能把 HMAC 密钥交给 RS256 验签路径。
+func generateRS256Token(t *testing.T) string {
+	t.Helper()
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	token := jwt.New(jwt.SigningMethodRS256)
+	token.Claims = jwt.MapClaims{"sub": "1234567890"}
+	signed, err := token.SignedString(privateKey)
+	require.NoError(t, err)
+	return signed
 }
 
 // buildRawToken 把 header/payload/signature 三段分别做 base64url 编码后拼成
@@ -81,6 +97,8 @@ func TestParseTokenValidInvalidInputs(t *testing.T) {
 		// 声明 alg=none 的未签名 Token 必须被算法白名单拒绝，不能交给 keyFunc 处理。
 		{name: "alg none token", tokenString: buildRawToken(`{"alg":"none","typ":"JWT"}`, `{"sub":"1234567890"}`, ""), wantValid: false, wantErr: true},
 		{name: "alg none token with bearer scheme", tokenString: "Bearer " + buildRawToken(`{"alg":"none","typ":"JWT"}`, `{"sub":"1234567890"}`, ""), wantValid: false, wantErr: true},
+		// RS256 不在白名单内：即使签名本身合法也必须拒绝，且不触发 keyFunc。
+		{name: "RS256 token rejected by allowlist", tokenString: generateRS256Token(t), wantValid: false, wantErr: true},
 		// 使用其它密钥签发的 Token 也必须被拒绝。
 		{name: "signed with another secret", tokenString: generateTestToken("another-secret"), wantValid: false, wantErr: true},
 		// 合法 Token 仍需被接受，"Bearer " 前缀大小写不敏感。

@@ -75,7 +75,15 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config Config, log log.Log) t
 	// 不向未认证的调用方暴露解析细节。
 	valid, parseErr := ParseTokenValid(token, config.TokenSecretKey)
 	if parseErr != nil {
-		log.Errorf("simple-jwt-auth: failed to parse token from header %q: %v", config.TokenHeaders, parseErr)
+		// 签名无效或算法不在白名单内是预期的攻击/调试流量，按 debug 级别记录
+		// 避免刷屏；格式畸形等其余解析失败仍按 error 级别记录，便于排查。
+		var validationErr *jwt.ValidationError
+		if errors.As(parseErr, &validationErr) &&
+			validationErr.Errors&jwt.ValidationErrorSignatureInvalid != 0 {
+			log.Debugf("simple-jwt-auth: token rejected by signature/algorithm check for header %q: %v", config.TokenHeaders, parseErr)
+		} else {
+			log.Errorf("simple-jwt-auth: failed to parse token from header %q: %v", config.TokenHeaders, parseErr)
+		}
 	}
 	if valid {
 		return types.ActionContinue
